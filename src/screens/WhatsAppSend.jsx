@@ -143,10 +143,17 @@ export default function WhatsAppSend({ caseData, go }) {
   const [selected, setSelected] = useState(null);
   const [loading, setLoading] = useState(true);
   const [address, setAddress] = useState(null);
+  const [recording, setRecording] = useState(false);
+  const [audioBlob, setAudioBlob] = useState(null);
+  const [audioURL, setAudioURL] = useState('');
+  const mediaRecorderRef = React.useRef(null);
+  const [audioFilename, setAudioFilename] = useState('');
+  const [navPromptVisible, setNavPromptVisible] = useState(false);
 
   const lat = caseData.location?.lat;
   const lng = caseData.location?.lng;
   const googleApiKey = process.env.REACT_APP_GOOGLE_MAPS_API_KEY || '';
+  const DEFAULT_COMMISSIONER_EMAIL = 'commissioner@ksp.karnataka.gov.in';
 
   // Build a short AI-style summary from the case data
   const buildAiSummary = () => {
@@ -171,6 +178,56 @@ export default function WhatsAppSend({ caseData, go }) {
     }
   };
 
+  const startRecording = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      alert('Audio recording not supported in this browser.');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mr = new MediaRecorder(stream);
+      const chunks = [];
+      mr.ondataavailable = (e) => chunks.push(e.data);
+      mr.onstop = () => {
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        setAudioBlob(blob);
+        const url = URL.createObjectURL(blob);
+        setAudioURL(url);
+        const fname = `FirstWitness_audio_${Date.now()}.webm`;
+        setAudioFilename(fname);
+        // stop all tracks
+        stream.getTracks().forEach((t) => t.stop());
+        mediaRecorderRef.current = null;
+        setRecording(false);
+      };
+      mr.start();
+      mediaRecorderRef.current = mr;
+      setRecording(true);
+    } catch (e) {
+      console.log('Recording failed', e);
+      alert('Unable to start audio recording.');
+    }
+  };
+
+  const stopRecording = () => {
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state !== 'inactive') mr.stop();
+    setRecording(false);
+  };
+
+  const playAudio = () => {
+    if (!audioURL) return;
+    const a = new Audio(audioURL);
+    a.play();
+  };
+
+  const removeAudio = () => {
+    if (audioURL) URL.revokeObjectURL(audioURL);
+    setAudioBlob(null);
+    setAudioURL('');
+    setAudioFilename('');
+  };
+
   const shareToFamily = (station) => {
     const aiSummaryText = buildAiSummary();
     const incidentAddressLocal = address?.fullAddress || (lat && lng ? `${lat.toFixed(5)}, ${lng.toFixed(5)}` : 'Unknown');
@@ -179,6 +236,16 @@ export default function WhatsAppSend({ caseData, go }) {
     // open WhatsApp web composer with message
     window.open(`https://wa.me/?text=${encoded}`, '_blank');
     go('confirmation', { selectedStation: station, action: 'share_family' });
+  };
+
+  const getHost = (maybeUrl) => {
+    if (!maybeUrl) return '';
+    try {
+      return new URL(maybeUrl).host;
+    } catch (e) {
+      // fallback: strip protocol and path
+      return maybeUrl.replace(/^https?:\/\//, '').split('/')[0] || maybeUrl;
+    }
   };
 
   useEffect(() => {
@@ -209,7 +276,8 @@ export default function WhatsAppSend({ caseData, go }) {
       // generate PDF including AI summary and voice instruction
       const aiSummaryText = buildAiSummary();
       const voiceInstructionText = buildVoiceInstruction();
-      downloadEvidencePDF(caseData, addr, aiSummaryText, voiceInstructionText);
+      // include audioFilename if user recorded audio
+      downloadEvidencePDF(caseData, addr, aiSummaryText, voiceInstructionText, audioFilename);
       console.log('PDF generated.');
 
       if (!googleApiKey) {
@@ -330,15 +398,74 @@ Requesting immediate assistance.` : '';
   };
 
   const handleNavigate = (station) => {
-    window.open(station.mapsLink, '_blank');
+    // Use live browser geolocation when available, otherwise fall back to caseData coordinates
+    const openMaps = (originLat, originLng) => {
+      try {
+        if (station?.lat && station?.lng) {
+          const origin = `${originLat},${originLng}`;
+          const dest = `${station.lat},${station.lng}`;
+          const mapsUrl = `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(dest)}&travelmode=driving`;
+          window.open(mapsUrl, '_blank');
+        } else if (station?.mapsLink) {
+          window.open(station.mapsLink, '_blank');
+        } else {
+          const q = encodeURIComponent(station.name || 'police station');
+          window.open(`https://www.google.com/maps/search/?api=1&query=${q}`, '_blank');
+        }
+      } catch (e) {
+        console.log('Navigate error', e);
+        if (station?.mapsLink) window.open(station.mapsLink, '_blank');
+      }
+    };
+
+    if (navigator.geolocation && typeof navigator.geolocation.getCurrentPosition === 'function') {
+      // request a fresh location; use a short timeout
+      const got = (pos) => {
+        const oLat = pos.coords.latitude;
+        const oLng = pos.coords.longitude;
+        openMaps(oLat, oLng);
+        // Show in-app prompt so browsers that block window.confirm still get the choice
+        setNavPromptVisible(true);
+      };
+      const err = (e) => {
+        console.log('Geolocation failed or denied, falling back to caseData location', e);
+        if (lat && lng) {
+          openMaps(lat, lng);
+        } else if (station?.mapsLink) {
+          window.open(station.mapsLink, '_blank');
+        }
+        setNavPromptVisible(true);
+      };
+      try {
+        navigator.geolocation.getCurrentPosition(got, err, { enableHighAccuracy: true, timeout: 8000, maximumAge: 10000 });
+      } catch (e) {
+        err(e);
+      }
+    } else {
+      // no geolocation support; fall back
+      if (lat && lng) {
+        openMaps(lat, lng);
+      } else if (station?.mapsLink) {
+        window.open(station.mapsLink, '_blank');
+      }
+      setNavPromptVisible(true);
+    }
+  };
+
+  const confirmNavProceed = (station) => {
+    setNavPromptVisible(false);
     go('confirmation', { selectedStation: station, action: 'navigate' });
+  };
+
+  const cancelNavProceed = () => {
+    setNavPromptVisible(false);
   };
 
   const handleShare = (station) => {
     const aiSummaryText = buildAiSummary();
     const voiceInstructionText = buildVoiceInstruction();
-    downloadEvidencePDF(caseData, address, aiSummaryText, voiceInstructionText);
-    const subject = 'Evidence Report';
+    downloadEvidencePDF(caseData, address, aiSummaryText, voiceInstructionText, audioFilename);
+    const subject = 'Evidence Report Submission';
     const body = `Incident: ${caseData.crimeType || 'Unknown'}
 GPS: ${lat?.toFixed(5)}°N, ${lng?.toFixed(5)}°E
 Address: ${incidentAddress}
@@ -349,19 +476,129 @@ Google Maps: ${station.mapsLink}`;
       window.open(`https://wa.me/${number}?text=${encodeURIComponent(`${subject}
 ${body}`)}`, '_blank');
     } else {
-      window.open(`mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`, '_blank');
+      const mailtoTo = 'police@ksp.gov.in';
+      const mailtoCc = 'compolbcp@ksp.gov.in';
+      window.open(`mailto:${mailtoTo}?cc=${encodeURIComponent(mailtoCc)}&subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`, '_blank');
     }
     go('confirmation', { selectedStation: station, action: 'share' });
   };
 
+  const handleSendEmailWithAttachment = async (station) => {
+    // Prefill government recipients as requested
+    const recipient = station?.email || 'police@ksp.gov.in';
+    const ccEmail = 'compolbcp@ksp.gov.in';
+    const aiSummaryText = buildAiSummary();
+    const voiceInstructionText = buildVoiceInstruction();
+    const filename = `FirstWitness_${caseData.crimeType || 'case'}_${Date.now()}.pdf`;
+    try {
+      const blob = await import('../utils/generatePDF').then(mod => mod.exportEvidencePDFBlob(caseData, address, aiSummaryText, voiceInstructionText, audioFilename));
+      const file = new File([blob], filename, { type: 'application/pdf' });
+
+      const subject = 'Evidence Report Submission';
+      const body = `Please find attached the evidence report generated through FirstWitness.\n\nIncident: ${caseData.crimeType || 'Unknown'}\nGPS: ${lat?.toFixed(5)}°N, ${lng?.toFixed(5)}°E\nAddress: ${incidentAddress}\nNearest station: ${station?.name || ''}`;
+
+      // First try: POST files to local mailer server (server must be running and configured)
+      try {
+        const fd = new FormData();
+        fd.append('file', file, filename);
+        if (audioBlob) fd.append('audio', audioBlob, audioFilename || 'recording.webm');
+        fd.append('to', recipient || 'police@ksp.gov.in');
+        fd.append('cc', ccEmail || 'compolbcp@ksp.gov.in');
+        fd.append('subject', subject);
+        fd.append('body', body);
+
+        const sendUrl = (window.__FIRSTWITNESS_MAILER_URL__) ? window.__FIRSTWITNESS_MAILER_URL__ + '/api/send-email' : '/api/send-email';
+        const mailRes = await fetch(sendUrl, { method: 'POST', body: fd });
+        if (mailRes.ok) {
+          alert('Email sent to police@ksp.gov.in');
+          go('confirmation', { selectedStation: station, action: 'email_share' });
+          return;
+        }
+        console.log('Mailer server responded with', mailRes.status, await mailRes.text());
+      } catch (errServer) {
+        console.log('Server-side send failed or unavailable:', errServer);
+      }
+
+      // Fallbacks if server not available: try Web Share API with files (mobile), then download+mailto
+      try {
+        // Include audio file in the Web Share payload when available
+        const filesToShare = [file];
+        if (audioBlob) {
+          const audioFile = new File([audioBlob], audioFilename || 'recording.webm', { type: audioBlob.type || 'audio/webm' });
+          filesToShare.push(audioFile);
+        }
+        if (navigator.share && navigator.canShare && navigator.canShare({ files: filesToShare })) {
+          try {
+            await navigator.share({ files: filesToShare, title: subject, text: body });
+            // navigator.share may open a native share sheet (including mail). Do not open a mailto afterwards —
+            // that causes duplicate compose windows on platforms that route share->Mail.
+            go('confirmation', { selectedStation: station, action: 'email_share' });
+            return;
+          } catch (errShare) {
+            console.log('Web Share API with files failed at share step:', errShare);
+            // fall through to download+mailto fallback
+          }
+        }
+      } catch (errShareOuter) {
+        console.log('Web Share API check failed:', errShareOuter);
+      }
+
+      // Final fallback: download and open mailto
+      // Download PDF (and audio if present) so user can manually attach them to their email.
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      let audioUrl = null;
+      let audioDownloadName = '';
+      if (audioBlob) {
+        audioUrl = URL.createObjectURL(audioBlob);
+        audioDownloadName = audioFilename || 'recording.webm';
+        const a2 = document.createElement('a');
+        a2.href = audioUrl;
+        a2.download = audioDownloadName;
+        document.body.appendChild(a2);
+        a2.click();
+        a2.remove();
+      }
+
+      const forcedTo = 'police@ksp.gov.in';
+      const forcedCc = 'compolbcp@ksp.gov.in';
+      let mailBody = body + '\n\nPlease attach the downloaded files to this email.';
+      if (url) mailBody += '\nPDF (downloaded): ' + url;
+      if (audioUrl) mailBody += '\nAudio (downloaded): ' + audioUrl;
+      const mailto = `mailto:${forcedTo}?cc=${encodeURIComponent(forcedCc)}&subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(mailBody)}`;
+      window.location.href = mailto;
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        if (audioUrl) URL.revokeObjectURL(audioUrl);
+      }, 60 * 1000);
+      go('confirmation', { selectedStation: station, action: 'email_share' });
+    } catch (err) {
+      console.log('Email with attachment failed', err);
+      // Clear, user-facing guidance rather than generic alert
+      alert('Automatic attachment not supported in this browser. The PDF has been downloaded — please attach it to your email and send. For automatic attach, open the app on mobile (Chrome on Android or Safari on iOS) and use "Send Email" there.');
+      // Ensure the PDF is available for manual attachment
+      const aiSummaryText2 = buildAiSummary();
+      const voiceInstructionText2 = buildVoiceInstruction();
+      downloadEvidencePDF(caseData, address, aiSummaryText2, voiceInstructionText2, audioFilename);
+    }
+  };
+
   const handleEmail = (station) => {
     if (!station.email) return;
-    const subject = 'Evidence Report';
+    const subject = 'Evidence Report Submission';
     const body = `Incident: ${caseData.crimeType || 'Unknown'}
 GPS: ${lat?.toFixed(5)}°N, ${lng?.toFixed(5)}°E
 Address: ${incidentAddress}
 Google Maps: ${station.mapsLink}`;
-    window.open(`mailto:${encodeURIComponent(station.email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`, '_blank');
+    const mailtoTo = 'police@ksp.gov.in';
+    const mailtoCc = 'compolbcp@ksp.gov.in';
+    window.open(`mailto:${mailtoTo}?cc=${encodeURIComponent(mailtoCc)}&subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`, '_blank');
     go('confirmation', { selectedStation: station, action: 'email' });
   };
 
@@ -475,7 +712,7 @@ Google Maps: ${station.mapsLink}`;
                   <div>Rating: {s.rating ?? 'Not available'}</div>
                   <div>Status: {s.openStatus}</div>
                   <div>Phone: {s.phone || 'Not available'}</div>
-                  <div>{s.website ? <a href={s.website} target="_blank" rel="noreferrer" style={{ color: '#25D366' }}>{new URL(s.website).host}</a> : 'Website unavailable'}</div>
+                  <div>{s.website ? <a href={s.website} target="_blank" rel="noreferrer" style={{ color: '#25D366' }}>{getHost(s.website)}</a> : 'Website unavailable'}</div>
                   <div>Coordinates: {s.lat && s.lng ? `${s.lat.toFixed(5)}, ${s.lng.toFixed(5)}` : 'Unavailable'}</div>
                 </div>
 
@@ -540,6 +777,25 @@ Google Maps: ${station.mapsLink}`;
                   >
                     📤 Share PDF
                   </button>
+                  <button
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      handleSendEmailWithAttachment(s);
+                    }}
+                    style={{
+                      flex: '1 1 120px',
+                      minWidth: 120,
+                      background: '#ff7043',
+                      border: 'none',
+                      borderRadius: 10,
+                      color: '#fff',
+                      padding: '12px 14px',
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    ✉ Send Email
+                  </button>
                 </div>
 
                 {s.email ? (
@@ -589,6 +845,18 @@ Google Maps: ${station.mapsLink}`;
                 <div style={{ display: 'flex', gap: 10, padding: '12px 16px' }}>
                   <button onClick={(e) => { e.stopPropagation(); playVoiceInstruction(); }} style={{ background: '#FFD166', border: 'none', borderRadius: 10, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>🔊 Play voice</button>
                   <button onClick={(e) => { e.stopPropagation(); shareToFamily(selected); }} style={{ background: '#4CC9F0', border: 'none', borderRadius: 10, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>👪 Share to family (as Police)</button>
+                  {!recording && (
+                    <button onClick={(e) => { e.stopPropagation(); startRecording(); }} style={{ background: '#E63946', border: 'none', borderRadius: 10, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>🎤 Record</button>
+                  )}
+                  {recording && (
+                    <button onClick={(e) => { e.stopPropagation(); stopRecording(); }} style={{ background: '#FF6B6B', border: 'none', borderRadius: 10, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>⏹ Stop</button>
+                  )}
+                  {audioBlob && (
+                    <>
+                      <button onClick={(e) => { e.stopPropagation(); playAudio(); }} style={{ background: '#7a1414', border: 'none', borderRadius: 10, padding: '8px 12px', fontWeight: 700, cursor: 'pointer', color: '#fff' }}>▶️ Play audio</button>
+                      <button onClick={(e) => { e.stopPropagation(); removeAudio(); }} style={{ background: '#3a3a3a', border: 'none', borderRadius: 10, padding: '8px 12px', fontWeight: 700, cursor: 'pointer' }}>🗑 Remove audio</button>
+                    </>
+                  )}
                 </div>
               </>
             ) : (

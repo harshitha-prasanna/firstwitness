@@ -1,6 +1,6 @@
 import jsPDF from 'jspdf';
 
-export function generateEvidencePDF(caseData, address, aiSummary = '', voiceInstruction = '') {
+export function generateEvidencePDF(caseData, address, aiSummary = '', voiceInstruction = '', audioFilename = '') {
   const doc = new jsPDF({ unit: 'pt', format: 'a4' });
   const pageWidth = doc.internal.pageSize.getWidth();
   const margin = 40;
@@ -52,6 +52,7 @@ export function generateEvidencePDF(caseData, address, aiSummary = '', voiceInst
     ['Case Started', caseData.timestamp ? new Date(caseData.timestamp).toLocaleString('en-IN') : '—'],
     ['Incident Address', addressText],
     ['Photos Captured', `${caseData.photos?.length || 0}`],
+    ['Audio Recordings', audioFilename ? '1 (attached)' : '0'],
     ['Language', (caseData.language || 'en').toUpperCase()],
     ['Report Generated', new Date().toLocaleString('en-IN')],
   ];
@@ -180,23 +181,23 @@ export function generateEvidencePDF(caseData, address, aiSummary = '', voiceInst
     doc.text(summaryLines, margin, y);
   }
 
-  // ── Voice instruction (text) ─────────────────────────────
-  if (voiceInstruction) {
+  // ── Audio attachment note ─────────────────────────────────
+  if (audioFilename) {
     doc.addPage();
     y = 50;
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(13);
     doc.setTextColor(20, 20, 20);
-    doc.text('Voice Instruction (written)', margin, y);
+    doc.text('Audio Attachment', margin, y);
     y += 10;
     doc.setDrawColor(230, 57, 70);
-    doc.line(margin, y, margin + 170, y);
+    doc.line(margin, y, margin + 140, y);
     y += 18;
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(10);
     doc.setTextColor(30, 30, 30);
-    const voiceLines = doc.splitTextToSize(String(voiceInstruction), pageWidth - margin * 2);
-    doc.text(voiceLines, margin, y);
+    const lines = doc.splitTextToSize(`An audio recording is attached with this report: ${audioFilename}. Please play the audio file provided alongside this PDF.`, pageWidth - margin * 2);
+    doc.text(lines, margin, y);
   }
 
   // ── Footer on every page ────────────────────────────────
@@ -216,8 +217,59 @@ export function generateEvidencePDF(caseData, address, aiSummary = '', voiceInst
   return doc;
 }
 
-export function downloadEvidencePDF(caseData, address, aiSummary = '', voiceInstruction = '') {
-  const doc = generateEvidencePDF(caseData, address, aiSummary, voiceInstruction);
+export function downloadEvidencePDF(caseData, address, aiSummary = '', voiceInstruction = '', audioFilename = '') {
+  const doc = generateEvidencePDF(caseData, address, aiSummary, voiceInstruction, audioFilename);
   const filename = `FirstWitness_${caseData.crimeType || 'case'}_${Date.now()}.pdf`;
   doc.save(filename);
+}
+
+export async function exportEvidencePDFBlob(caseData, address, aiSummary = '', voiceInstruction = '', audioFilename = '') {
+  const doc = generateEvidencePDF(caseData, address, aiSummary, voiceInstruction, audioFilename);
+  // jsPDF supports output('blob') to get a Blob
+  // Try arraybuffer -> blob -> datauri variations for compatibility
+  if (doc.output && typeof doc.output === 'function') {
+    // 1) arraybuffer
+    try {
+      const ab = doc.output('arraybuffer');
+      if (ab && (ab instanceof ArrayBuffer || ArrayBuffer.isView(ab))) {
+        return new Blob([ab], { type: 'application/pdf' });
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // 2) blob
+    try {
+      const blob = doc.output('blob');
+      if (blob && blob instanceof Blob) return blob;
+    } catch (e) {
+      // ignore
+    }
+
+    // 3) datauri / datauristring
+    const dataUriCandidates = ['datauristring', 'dataurlstring', 'datauri'];
+    for (const name of dataUriCandidates) {
+      try {
+        const dataUri = doc.output(name);
+        if (dataUri && typeof dataUri === 'string' && dataUri.indexOf(',') > -1) {
+          const parts = dataUri.split(',');
+          const base64 = parts[1];
+          let binary = '';
+          if (typeof atob === 'function') {
+            binary = atob(base64);
+          } else if (typeof Buffer !== 'undefined') {
+            binary = Buffer.from(base64, 'base64').toString('binary');
+          }
+          const len = binary.length;
+          const u8 = new Uint8Array(len);
+          for (let i = 0; i < len; i++) u8[i] = binary.charCodeAt(i);
+          return new Blob([u8], { type: 'application/pdf' });
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
+
+  throw new Error('Unable to export PDF blob');
 }
